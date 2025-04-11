@@ -38,7 +38,7 @@ SUCCESS_COLOR = "#03DAC6"
 APKTOOL_PATH = "apktool.jar"
 
 # Supported APK-like extensions
-APK_EXTENSIONS = ['.apk', '.xapk', '.apkm', '.apks']  # Add more as needed
+APK_EXTENSIONS = ['.apk', '.xapk', '.apkm', '.apks']
 
 class AnalysisThread(QThread):
     update_signal = pyqtSignal(str)
@@ -53,7 +53,7 @@ class AnalysisThread(QThread):
 
     def run(self):
         try:
-            if self.file_type in [ext[1:] for ext in APK_EXTENSIONS]:  # Strip '.' from extensions
+            if self.file_type in [ext[1:] for ext in APK_EXTENSIONS]:
                 apk_file = self.extract_apk_variant()
                 if not apk_file:
                     self.finished_signal.emit([f"Failed to extract {self.file_type.upper()}"], [])
@@ -74,10 +74,9 @@ class AnalysisThread(QThread):
             self.cleanup()
 
     def extract_apk_variant(self):
-        """Extract APK from any APK-like variant (APK, XAPK, APKM, etc.)."""
         self.update_signal.emit(f"Unpacking {self.file_type.upper()}...")
         if self.file_type == 'apk':
-            return self.file_path  # Single APK, no extraction needed
+            return self.file_path
         
         self.temp_dir = tempfile.mkdtemp()
         try:
@@ -85,7 +84,6 @@ class AnalysisThread(QThread):
                 apk_files = [f for f in z.infolist() if f.filename.endswith('.apk')]
                 if not apk_files:
                     return None
-                # Look for a base APK or the first APK in the bundle
                 base_apk = next((f for f in apk_files if 'base' in f.filename.lower()), apk_files[0])
                 extracted_path = z.extract(base_apk, self.temp_dir)
                 self.update_signal.emit(f"Extracted APK: {os.path.basename(extracted_path)}")
@@ -111,7 +109,7 @@ class AnalysisThread(QThread):
             if not os.path.exists(APKTOOL_PATH):
                 raise FileNotFoundError(f"apktool.jar not found at {APKTOOL_PATH}")
             subprocess.run(['java', '-jar', APKTOOL_PATH, 'd', apk_file, '-f', '-o', self.decompile_dir], 
-                          check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                           check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.update_signal.emit("APK decompiled successfully.")
             return self.decompile_dir
         except Exception as e:
@@ -122,9 +120,11 @@ class AnalysisThread(QThread):
         self.update_signal.emit("Checking DEX files...")
         vulnerabilities = set()
         sample_count = 0
-        max_samples = 1000  # Limit for efficiency
+        max_samples = 1000
+        cipher_instances = {}  # Track cipher usage for initialization checks
 
         for cls in dx.get_classes():
+            class_name = cls.get_vm_class().get_name()
             for method in cls.get_methods():
                 if sample_count >= max_samples:
                     self.update_signal.emit("Sampling limit reached, skipping remaining methods...")
@@ -133,12 +133,14 @@ class AnalysisThread(QThread):
                     raw_method = method.get_method()
                     if isinstance(raw_method, EncodedMethod) and raw_method.get_code():
                         instructions = list(raw_method.get_code().get_bc().get_instructions())
-                        class_name = cls.get_vm_class().get_name()
-                        for i, ins in enumerate(instructions[:100]):  # Limit instructions per method
+                        has_init = False
+                        for i, ins in enumerate(instructions[:100]):
                             ins_str = ins.get_name() + " " + " ".join(map(str, ins.get_operands()))
+                            # Weak algorithms
                             for weak in ['des', 'md5', 'sha1', 'rc4', 'sha', '3des', 'rc2', 'blowfish']:
                                 if weak in ins_str.lower():
                                     vulnerabilities.add(f"Detected weak algorithm '{weak.upper()}' in {class_name}")
+                            # Key length checks
                             if 'Ljavax/crypto/KeyGenerator' in ins_str or 'Ljava/security/KeyPairGenerator' in ins_str:
                                 for j in range(i, min(i + 5, len(instructions))):
                                     next_ins = instructions[j]
@@ -152,6 +154,26 @@ class AnalysisThread(QThread):
                                                 vulnerabilities.add(f"Insufficient key length ({key_length} bits) for RSA in {class_name}")
                                             elif 'des' in ins_str.lower() and key_length <= 56:
                                                 vulnerabilities.add(f"Insufficient key length ({key_length} bits) for DES in {class_name}")
+                            # Improper Key Management & Flawed Encryption Implementation
+                            if 'Ljavax/crypto/spec/SecretKeySpec' in ins_str or 'Ljavax/crypto/Cipher' in ins_str:
+                                if 'const-string' in ins_str.lower():
+                                    vulnerabilities.add(f"Possible static key usage detected in {class_name}")
+                                cipher_instances[method] = i  # Track cipher instance
+                            if 'Ljavax/crypto/Cipher;->init' in ins_str:
+                                has_init = True
+                            # Lack of Salting (for MessageDigest)
+                            if 'Ljava/security/MessageDigest' in ins_str and 'getInstance' in ins_str:
+                                salted = False
+                                for j in range(max(0, i - 5), min(i + 5, len(instructions))):
+                                    prev_ins = instructions[j]
+                                    if 'PBEKeySpec' in prev_ins.get_name() or 'SecureRandom' in prev_ins.get_name():
+                                        salted = True
+                                        break
+                                if not salted:
+                                    vulnerabilities.add(f"Unsalted hash personally detected in {class_name}")
+                        # Check if cipher was initialized
+                        if method in cipher_instances and not has_init:
+                            vulnerabilities.add(f"Improper cipher initialization detected in {class_name}")
                         sample_count += 1
                         if sample_count % 100 == 0:
                             self.update_signal.emit(f"Processed {sample_count} methods...")
@@ -190,11 +212,25 @@ class AnalysisThread(QThread):
                     content = f.read(1024 * 1024)
                     content_lower = content.lower()
                     lines = content_lower.split('\n')
+                    # Weak algorithms
                     for weak in weak_algorithms:
                         if weak in content_lower:
                             vulnerabilities.add(f"Detected weak algorithm '{weak.upper()}' in Smali file: {os.path.basename(smali_file)}")
-                    if 'const-string' in content_lower and 'key' in content_lower:
-                        vulnerabilities.add(f"Possible hardcoded key in Smali file: {os.path.basename(smali_file)}")
+                    # Improper Key Management
+                    if 'const-string' in content_lower and ('secretkeyspec' in content_lower or 'cipher' in content_lower):
+                        vulnerabilities.add(f"Possible static key usage in Smali file: {os.path.basename(smali_file)}")
+                    # Insecure Storage of Data/Keys
+                    if 'sharedpreferences' in content_lower or 'fileoutputstream' in content_lower:
+                        vulnerabilities.add(f"Potential insecure storage (SharedPreferences/File) in Smali file: {os.path.basename(smali_file)}")
+                    # Lack of Salting
+                    if 'messagedigest' in content_lower and 'getinstance' in content_lower:
+                        salted = False
+                        for line in lines:
+                            if 'pbekeyspec' in line or 'securerandom' in line:
+                                salted = True
+                                break
+                        if not salted:
+                            vulnerabilities.add(f"Unsalted hash usage in Smali file: {os.path.basename(smali_file)}")
             except Exception:
                 continue
         return list(vulnerabilities)
@@ -222,8 +258,14 @@ class AnalysisThread(QThread):
                 weak_algos.add(algo)
             elif "insufficient key length" in vuln.lower():
                 summarized_vulns.add("Insufficient Key Lengths detected [Insufficient Key Length]")
-            elif "hardcoded key" in vuln.lower():
-                summarized_vulns.add("Possible Hardcoded Keys detected")
+            elif "static key" in vuln.lower():
+                summarized_vulns.add("Improper Key Management detected [Static Key Usage]")
+            elif "insecure storage" in vuln.lower():
+                summarized_vulns.add("Insecure Storage detected [Potential Key/Data Exposure]")
+            elif "improper cipher" in vuln.lower():
+                summarized_vulns.add("Flawed Encryption Implementation detected [Improper Cipher Init]")
+            elif "unsalted hash" in vuln.lower():
+                summarized_vulns.add("Lack of Salting detected [Unsalted Hash Usage]")
             elif "permission" in vuln.lower() or "cleartext" in vuln.lower():
                 summarized_vulns.add("Insecure Permissions or Settings detected")
             else:
@@ -231,7 +273,7 @@ class AnalysisThread(QThread):
         
         if weak_algos:
             algo_list = ", ".join(sorted(weak_algos))
-            summarized_vulns.add(f"Weak Encryption Algorithms detected ({algo_list})")
+            summarized_vulns.add(f"Weak Encryption Algorithms detected ({algo_list}) [Weak Encryption Algorithm]")
         
         return list(summarized_vulns), list(vulnerabilities)
 
@@ -260,7 +302,6 @@ class AnalysisThread(QThread):
             return [f"Error analyzing IPA: {str(e)}"], []
 
     def lightweight_analysis(self):
-        """Fallback analysis for large files with memory issues."""
         vulnerabilities = set()
         if self.file_type in [ext[1:] for ext in APK_EXTENSIONS]:
             vulnerabilities.add(f"Lightweight mode: Limited analysis for {self.file_type.upper()} due to file size.")
@@ -604,48 +645,113 @@ class CipherWraith(QMainWindow):
         self.static_status.setText("Complete")
         self.full_vulnerabilities = full_vulns
 
+        # Color mapping for vulnerabilities
+        vuln_colors = {
+            "Weak Encryption Algorithms": "#FF5252",  # Red
+            "Insufficient Key Lengths": "#FFD740",    # Yellow
+            "Improper Key Management": "#FFAB40",     # Orange
+            "Flawed Encryption Implementation": "#64B5F6",  # Blue
+            "Insecure Storage": "#81C784",            # Green
+            "Lack of Salting": "#BA68C8",             # Purple
+            "Other Issues": "#FF8A65"                 # Coral
+        }
+
         # Summary Tab
-        self.summary_tab.append("<hr><h3 style='color: #BB86FC;'>Analysis Results</h3>")
+        self.summary_tab.append(f"<hr><h3 style='color: #BB86FC;'>Analysis Results</h3>")
         if summarized_vulns:
             self.summary_tab.append("<ul style='margin-left: 20px;'>")
             for vuln in summarized_vulns:
-                self.summary_tab.append(f"<li style='color: {ERROR_COLOR};'>{vuln}</li>")
-            if not any("insufficient key length" in v.lower() for v in full_vulns):
-                self.summary_tab.append(f"<li style='color: {SUCCESS_COLOR};'>No Insufficient Key Lengths detected</li>")
+                # Determine the color based on vulnerability type
+                if "Weak Encryption Algorithms" in vuln:
+                    color = vuln_colors["Weak Encryption Algorithms"]
+                elif "Insufficient Key Lengths" in vuln:
+                    color = vuln_colors["Insufficient Key Lengths"]
+                elif "Improper Key Management" in vuln:
+                    color = vuln_colors["Improper Key Management"]
+                elif "Flawed Encryption Implementation" in vuln:
+                    color = vuln_colors["Flawed Encryption Implementation"]
+                elif "Insecure Storage" in vuln:
+                    color = vuln_colors["Insecure Storage"]
+                elif "Lack of Salting" in vuln:
+                    color = vuln_colors["Lack of Salting"]
+                elif "No Insufficient Key Lengths" in vuln:
+                    color = SUCCESS_COLOR  # Keep success color for "No issues"
+                else:
+                    color = vuln_colors["Other Issues"]  # Default to Other Issues
+                self.summary_tab.append(f"<li style='color: {color};'>{vuln}</li>")
             
         else:
             self.summary_tab.append("<p style='color: #03DAC6;'>✔ No issues found.</p>")
 
         # Detailed Tab
-        self.detailed_tab.append("<hr><h3 style='color: #BB86FC;'>Detailed Analysis Results</h3>")
+        self.detailed_tab.append(f"<hr><h3 style='color: #BB86FC;'>Detailed Analysis Results</h3>")
         if full_vulns:
             weak_algo_vulns = [v for v in full_vulns if "weak algorithm" in v.lower()]
             insuf_key_vulns = [v for v in full_vulns if "insufficient key length" in v.lower()]
-            other_vulns = [v for v in full_vulns if v not in weak_algo_vulns and v not in insuf_key_vulns]
+            key_mgmt_vulns = [v for v in full_vulns if "static key" in v.lower()]
+            cipher_init_vulns = [v for v in full_vulns if "improper cipher" in v.lower()]
+            storage_vulns = [v for v in full_vulns if "insecure storage" in v.lower()]
+            salting_vulns = [v for v in full_vulns if "unsalted hash" in v.lower()]
+            other_vulns = [v for v in full_vulns if v not in weak_algo_vulns and v not in insuf_key_vulns and v not in key_mgmt_vulns and v not in cipher_init_vulns and v not in storage_vulns and v not in salting_vulns]
 
             if weak_algo_vulns:
-                self.detailed_tab.append("<h4 style='color: #FF9800;'><b>Weak Encryption Algorithms</b></h4>")
+                self.detailed_tab.append(f"<h4 style='color: {vuln_colors['Weak Encryption Algorithms']};'><b>Weak Encryption Algorithms</b></h4>")
                 self.detailed_tab.append("<ul style='margin-left: 20px;'>")
                 for vuln in weak_algo_vulns:
-                    self.detailed_tab.append(f"<li style='color: {ERROR_COLOR};'>{vuln}</li>")
-                
+                    self.detailed_tab.append(f"<li style='color: {vuln_colors['Weak Encryption Algorithms']};'>{vuln}</li>")
             else:
                 self.detailed_tab.append("<p style='color: #03DAC6;'>✔ No weak encryption algorithms found.</p>")
 
             if insuf_key_vulns:
-                self.detailed_tab.append("<h4 style='color: #E91E63;'><b>Insufficient Key Length</b></h4>")
+                self.detailed_tab.append(f"<h4 style='color: {vuln_colors['Insufficient Key Lengths']};'><b>Insufficient Key Length</b></h4>")
                 self.detailed_tab.append("<ul style='margin-left: 20px;'>")
                 for vuln in insuf_key_vulns:
-                    self.detailed_tab.append(f"<li style='color: {ERROR_COLOR};'>{vuln}</li>")
+                    self.detailed_tab.append(f"<li style='color: {vuln_colors['Insufficient Key Lengths']};'>{vuln}</li>")
                 
             else:
                 self.detailed_tab.append("<p style='color: #03DAC6;'>✔ No insufficient key lengths found.</p>")
 
+            if key_mgmt_vulns:
+                self.detailed_tab.append(f"<h4 style='color: {vuln_colors['Improper Key Management']};'><b>Improper Key Management</b></h4>")
+                self.detailed_tab.append("<ul style='margin-left: 20px;'>")
+                for vuln in key_mgmt_vulns:
+                    self.detailed_tab.append(f"<li style='color: {vuln_colors['Improper Key Management']};'>{vuln}</li>")
+                
+            else:
+                self.detailed_tab.append("<p style='color: #03DAC6;'>✔ No improper key management found.</p>")
+
+            if cipher_init_vulns:
+                self.detailed_tab.append(f"<h4 style='color: {vuln_colors['Flawed Encryption Implementation']};'><b>Flawed Encryption Implementation</b></h4>")
+                self.detailed_tab.append("<ul style='margin-left: 20px;'>")
+                for vuln in cipher_init_vulns:
+                    self.detailed_tab.append(f"<li style='color: {vuln_colors['Flawed Encryption Implementation']};'>{vuln}</li>")
+                
+            else:
+                self.detailed_tab.append("<p style='color: #03DAC6;'>✔ No flawed encryption implementation found.</p>")
+
+            if storage_vulns:
+                self.detailed_tab.append(f"<h4 style='color: {vuln_colors['Insecure Storage']};'><b>Insecure Storage</b></h4>")
+                self.detailed_tab.append("<ul style='margin-left: 20px;'>")
+                for vuln in storage_vulns:
+                    self.detailed_tab.append(f"<li style='color: {vuln_colors['Insecure Storage']};'>{vuln}</li>")
+                
+            else:
+                self.detailed_tab.append("<p style='color: #03DAC6;'>✔ No insecure storage found.</p>")
+
+            if salting_vulns:
+                self.detailed_tab.append(f"<h4 style='color: {vuln_colors['Lack of Salting']};'><b>Lack of Salting</b></h4>")
+                self.detailed_tab.append("<ul style='margin-left: 20px;'>")
+                for vuln in salting_vulns:
+                    self.detailed_tab.append(f"<li style='color: {vuln_colors['Lack of Salting']};'>{vuln}</li>")
+                
+            else:
+                self.detailed_tab.append("<p style='color: #03DAC6;'>✔ No unsalted hashes found.</p>")
+
             if other_vulns:
-                self.detailed_tab.append("<h4 style='color: #FF5722;'><b>Other Issues</b></h4>")
+                self.detailed_tab.append(f"<h4 style='color: {vuln_colors['Other Issues']};'><b>Other Issues</b></h4>")
                 self.detailed_tab.append("<ul style='margin-left: 20px;'>")
                 for vuln in other_vulns:
-                    self.detailed_tab.append(f"<li style='color: {ERROR_COLOR};'>{vuln}</li>")
+                    self.detailed_tab.append(f"<li style='color: {vuln_colors['Other Issues']};'>{vuln}</li>")
                 
 
         # Potential Risks
@@ -656,13 +762,17 @@ class CipherWraith(QMainWindow):
             risks.append("Scenario #1: Man-in-the-Middle (MitM) Attacks - An attacker intercepts communication.")
         if "weak" in combined_vulns or "insufficient" in combined_vulns:
             risks.append("Scenario #2: Brute-Force Attacks - Weak cryptography enables cracking.")
-        if "hardcoded" in combined_vulns or "key" in combined_vulns:
+        if "static key" in combined_vulns or "insecure storage" in combined_vulns:
             risks.append("Scenario #4: Key Management Vulnerabilities - Exposed keys mean leaks.")
+        if "improper cipher" in combined_vulns:
+            risks.append("Scenario #5: Encryption Bypass - Flawed implementation allows bypassing protections.")
+        if "unsalted hash" in combined_vulns:
+            risks.append("Scenario #6: Hash Cracking - Unsalted hashes are vulnerable to pre-computed attacks.")
         if risks:
             self.summary_tab.append("<ul style='margin-left: 20px;'>")
             for risk in risks:
                 self.summary_tab.append(f"<li style='color: {ERROR_COLOR};'>{risk}</li>")
-            
+           
             self.summary_tab.append("<p style='color: #E0E0E0;'>Recommendation: Avoid sensitive data usage or contact the developer.</p>")
         else:
             self.summary_tab.append("<p style='color: #03DAC6;'>✔ No significant risks detected.</p>")
